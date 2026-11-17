@@ -1,0 +1,272 @@
+MDEV-39993 - Validation of fix
+mariadb-upgrade drops existing EXECUTE grants on sys stored routines
+=====================================================================
+Date tested : 2026-11-17
+Jira        : https://jira.mariadb.org/browse/MDEV-39993
+Jira status : Closed / Fixed
+Fix versions: 11.4.14, 11.8.10, 12.3.4, 13.1.2
+Fix PR      : https://github.com/MariaDB/server/pull/5698
+
+RESULT: FIX VERIFIED for upgrade 10.11.15 -> 11.8.10
+-----------------------------------------------------
+
+Summary
+-------
+Upgrade path                    Before upgrade  After mariadb-upgrade         myuser calls sys.quote_identifier
+------------------------------  --------------  ----------------------------  ---------------------------------
+10.11.15 -> 11.4.10 (reported)  4 rows          2 rows - EXECUTE grants LOST  ERROR 1370 execute command denied
+10.11.15 -> 11.8.9 (control)    4 rows          2 rows - EXECUTE grants LOST  ERROR 1370 execute command denied
+10.11.15 -> 11.8.10 (fixed)     4 rows          4 rows - EXECUTE grants KEPT  OK
+
+Observations on 11.8.10
+-----------------------
+- mysql.procs_priv still holds all 4 sys rows (myuser / myuser1 x table_exists / quote_identifier)
+  after mariadb-upgrade.
+- The sys schema IS reinstalled during the upgrade (sys_version 1.5.1 -> 1.5.2), so the grants
+  survive a real reinstall, not a skipped one.
+- A second run of "mariadb-upgrade --force" also keeps the grants.
+- myuser can call sys.quote_identifier('a b') -> `a b`, and
+  sys.table_exists('mysql','user',@e) -> VIEW.
+- The fix's own regression test, main.mysql_upgrade_sys_routine_grants, passes on this build:
+    main.mysql_upgrade_sys_routine_grants    [ pass ]
+
+What the fix changed
+--------------------
+The sys schema routine scripts previously dropped and re-created each routine, which removed its
+rows from mysql.procs_priv. In 11.8.10 all sys procedures/functions
+(scripts/sys_schema/procedures/*.sql, functions/*.sql) use CREATE OR REPLACE, which keeps
+existing routine-level grants.
+
+Test environment / differences from the original RHEL test
+----------------------------------------------------------
+- Source version : official Docker image mariadb:10.11.15 (Ubuntu based).
+- 11.4.10, 11.8.9: official Docker images mariadb:11.4.10, mariadb:11.8.9.
+- 11.8.10        : released 2026-11-16 but not yet published on Docker Hub, and MariaDB download
+                   servers were not reachable from the test environment. Built from the upstream
+                   git tag mariadb-11.8.10 (commit d04ba7c69bc7fa1719cfc4b8c6393a6d8529b755),
+                   RelWithDebInfo, on Ubuntu 24.04.
+- mariadb-upgrade was run manually (no auto-upgrade), as in the customer scenario.
+- The bug lives in the SQL scripts run by mariadb-upgrade, so the platform difference is not
+  expected to change the result. To confirm on RHEL 9:
+    ./mariadb_repo_setup --mariadb-server-version="mariadb-11.8.10"
+
+Note for the customer
+---------------------
+The fix prevents the grants from being dropped. It does not restore grants an earlier upgrade has
+already removed. Systems that already ran mariadb-upgrade on an unfixed release (e.g. 11.4.10 -
+11.4.13, 11.8.x <= 11.8.9) most likely need the grants re-applied, e.g.:
+    GRANT EXECUTE ON PROCEDURE sys.table_exists   TO 'myuser'@'%';
+    GRANT EXECUTE ON FUNCTION  sys.quote_identifier TO 'myuser'@'%';
+
+Test steps
+----------
+1. Start 10.11.15 on an empty datadir and run:
+     CREATE USER 'myuser'@'%'  IDENTIFIED BY 'Pass1';
+     CREATE USER 'myuser1'@'%' IDENTIFIED BY 'Pass2';
+     GRANT SELECT ON mysql.user TO 'myuser'@'%';
+     GRANT SELECT ON mysql.user TO 'myuser1'@'%';
+     GRANT EXECUTE ON PROCEDURE sys.table_exists   TO 'myuser'@'%';
+     GRANT EXECUTE ON FUNCTION  sys.quote_identifier TO 'myuser'@'%';
+     GRANT EXECUTE ON PROCEDURE sys.table_exists   TO 'myuser1'@'%';
+     GRANT EXECUTE ON FUNCTION  sys.quote_identifier TO 'myuser1'@'%';
+     SELECT @@version;
+     SELECT sys_version FROM sys.version;
+     SHOW GRANTS FOR 'myuser'@'%';
+     SHOW GRANTS FOR 'myuser1'@'%';
+     SELECT Host,Db,User,Routine_name,Routine_type,Proc_priv FROM mysql.procs_priv WHERE Db='sys' ORDER BY User,Routine_name;
+     SET GLOBAL innodb_fast_shutdown=0;
+2. Clean shutdown of 10.11.15 (innodb_fast_shutdown=0).
+3. Start the target version on the same datadir; record grants.
+4. Run mariadb-upgrade; record grants again; connect as myuser and call the sys routines.
+
+Checks run before and after mariadb-upgrade:
+     SELECT @@version;
+     SELECT sys_version FROM sys.version;
+     SHOW GRANTS FOR 'myuser'@'%';
+     SHOW GRANTS FOR 'myuser1'@'%';
+     SELECT Host,Db,User,Routine_name,Routine_type,Proc_priv FROM mysql.procs_priv WHERE Db='sys' ORDER BY User,Routine_name;
+
+
+#####################################################################
+# FULL LOG: 10.11.15 -> 11.4.10
+#####################################################################
+===== 11.4.10: BEFORE mariadb-upgrade =====
+@@version
+11.4.10-MariaDB-ubu2404
+sys_version
+1.5.1
+Grants for myuser@%
+GRANT USAGE ON *.* TO `myuser`@`%` IDENTIFIED BY PASSWORD '*1C89832CCEEEC59E3D41A652E0DC01680F6D20CD'
+GRANT SELECT ON `mysql`.`user` TO `myuser`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser`@`%`
+Grants for myuser1@%
+GRANT USAGE ON *.* TO `myuser1`@`%` IDENTIFIED BY PASSWORD '*91F3EE74586051165E602C7D21080DE4A18977AF'
+GRANT SELECT ON `mysql`.`user` TO `myuser1`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser1`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser1`@`%`
+Host	Db	User	Routine_name	Routine_type	Proc_priv
+%	sys	myuser	quote_identifier	FUNCTION	Execute
+%	sys	myuser	table_exists	PROCEDURE	Execute
+%	sys	myuser1	quote_identifier	FUNCTION	Execute
+%	sys	myuser1	table_exists	PROCEDURE	Execute
+===== 11.4.10: running mariadb-upgrade =====
+Phase 1/8: Checking and upgrading mysql database
+Phase 2/8: Installing used storage engines... Skipped
+Phase 3/8: Running 'mysql_fix_privilege_tables'
+Phase 4/8: Fixing views
+Phase 5/8: Fixing table and database names
+Phase 6/8: Checking and upgrading tables
+sys.sys_config                                     OK
+Phase 7/8: uninstalling plugins
+Phase 8/8: Running 'FLUSH PRIVILEGES'
+OK
+===== 11.4.10: AFTER mariadb-upgrade =====
+@@version
+11.4.10-MariaDB-ubu2404
+sys_version
+1.5.2
+Grants for myuser@%
+GRANT USAGE ON *.* TO `myuser`@`%` IDENTIFIED BY PASSWORD '*1C89832CCEEEC59E3D41A652E0DC01680F6D20CD'
+GRANT SELECT ON `mysql`.`user` TO `myuser`@`%`
+Grants for myuser1@%
+GRANT USAGE ON *.* TO `myuser1`@`%` IDENTIFIED BY PASSWORD '*91F3EE74586051165E602C7D21080DE4A18977AF'
+GRANT SELECT ON `mysql`.`user` TO `myuser1`@`%`
+===== 11.4.10: functional check as myuser =====
+--------------
+SELECT sys.quote_identifier('a b') AS qi
+--------------
+
+ERROR 1370 (42000) at line 1: execute command denied to user 'myuser'@'%' for routine 'sys.quote_identifier'
+
+
+#####################################################################
+# FULL LOG: 10.11.15 -> 11.8.9
+#####################################################################
+===== 11.8.9: BEFORE mariadb-upgrade =====
+@@version
+11.8.9-MariaDB-ubu2404
+sys_version
+1.5.1
+Grants for myuser@%
+GRANT USAGE ON *.* TO `myuser`@`%` IDENTIFIED BY PASSWORD '*1C89832CCEEEC59E3D41A652E0DC01680F6D20CD'
+GRANT SELECT ON `mysql`.`user` TO `myuser`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser`@`%`
+Grants for myuser1@%
+GRANT USAGE ON *.* TO `myuser1`@`%` IDENTIFIED BY PASSWORD '*91F3EE74586051165E602C7D21080DE4A18977AF'
+GRANT SELECT ON `mysql`.`user` TO `myuser1`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser1`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser1`@`%`
+Host	Db	User	Routine_name	Routine_type	Proc_priv
+%	sys	myuser	quote_identifier	FUNCTION	Execute
+%	sys	myuser	table_exists	PROCEDURE	Execute
+%	sys	myuser1	quote_identifier	FUNCTION	Execute
+%	sys	myuser1	table_exists	PROCEDURE	Execute
+===== 11.8.9: running mariadb-upgrade =====
+Phase 1/8: Checking and upgrading mysql database
+Phase 2/8: Installing used storage engines... Skipped
+Phase 3/8: Running 'mysql_fix_privilege_tables'
+Phase 4/8: Fixing views
+Phase 5/8: Fixing table and database names
+Phase 6/8: Checking and upgrading tables
+sys.sys_config                                     OK
+Phase 7/8: uninstalling plugins
+Phase 8/8: Running 'FLUSH PRIVILEGES'
+OK
+===== 11.8.9: AFTER mariadb-upgrade =====
+@@version
+11.8.9-MariaDB-ubu2404
+sys_version
+1.5.2
+Grants for myuser@%
+GRANT USAGE ON *.* TO `myuser`@`%` IDENTIFIED BY PASSWORD '*1C89832CCEEEC59E3D41A652E0DC01680F6D20CD'
+GRANT SELECT ON `mysql`.`user` TO `myuser`@`%`
+Grants for myuser1@%
+GRANT USAGE ON *.* TO `myuser1`@`%` IDENTIFIED BY PASSWORD '*91F3EE74586051165E602C7D21080DE4A18977AF'
+GRANT SELECT ON `mysql`.`user` TO `myuser1`@`%`
+===== 11.8.9: functional check as myuser =====
+--------------
+SELECT sys.quote_identifier('a b') AS qi
+--------------
+
+ERROR 1370 (42000) at line 1: execute command denied to user 'myuser'@'%' for routine 'sys.quote_identifier'
+
+
+#####################################################################
+# FULL LOG: 10.11.15 -> 11.8.10
+#####################################################################
+===== target: BEFORE mariadb-upgrade =====
+@@version
+11.8.10-MariaDB
+sys_version
+1.5.1
+Grants for myuser@%
+GRANT USAGE ON *.* TO `myuser`@`%` IDENTIFIED BY PASSWORD '*1C89832CCEEEC59E3D41A652E0DC01680F6D20CD'
+GRANT SELECT ON `mysql`.`user` TO `myuser`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser`@`%`
+Grants for myuser1@%
+GRANT USAGE ON *.* TO `myuser1`@`%` IDENTIFIED BY PASSWORD '*91F3EE74586051165E602C7D21080DE4A18977AF'
+GRANT SELECT ON `mysql`.`user` TO `myuser1`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser1`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser1`@`%`
+Host	Db	User	Routine_name	Routine_type	Proc_priv
+%	sys	myuser	quote_identifier	FUNCTION	Execute
+%	sys	myuser	table_exists	PROCEDURE	Execute
+%	sys	myuser1	quote_identifier	FUNCTION	Execute
+%	sys	myuser1	table_exists	PROCEDURE	Execute
+===== target: running mariadb-upgrade =====
+Phase 1/8: Checking and upgrading mysql database
+Phase 2/8: Installing used storage engines... Skipped
+Phase 3/8: Running 'mysql_fix_privilege_tables'
+Phase 4/8: Fixing views
+Phase 5/8: Fixing table and database names
+Phase 6/8: Checking and upgrading tables
+sys.sys_config                                     OK
+Phase 7/8: uninstalling plugins
+Phase 8/8: Running 'FLUSH PRIVILEGES'
+OK
+===== target: AFTER mariadb-upgrade =====
+@@version
+11.8.10-MariaDB
+sys_version
+1.5.2
+Grants for myuser@%
+GRANT USAGE ON *.* TO `myuser`@`%` IDENTIFIED BY PASSWORD '*1C89832CCEEEC59E3D41A652E0DC01680F6D20CD'
+GRANT SELECT ON `mysql`.`user` TO `myuser`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser`@`%`
+Grants for myuser1@%
+GRANT USAGE ON *.* TO `myuser1`@`%` IDENTIFIED BY PASSWORD '*91F3EE74586051165E602C7D21080DE4A18977AF'
+GRANT SELECT ON `mysql`.`user` TO `myuser1`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser1`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser1`@`%`
+Host	Db	User	Routine_name	Routine_type	Proc_priv
+%	sys	myuser	quote_identifier	FUNCTION	Execute
+%	sys	myuser	table_exists	PROCEDURE	Execute
+%	sys	myuser1	quote_identifier	FUNCTION	Execute
+%	sys	myuser1	table_exists	PROCEDURE	Execute
+===== target: functional check as myuser =====
+qi
+`a b`
+table_exists_result
+VIEW
+===== target: second run (mariadb-upgrade --force) =====
+OK
+Grants for myuser@%
+GRANT USAGE ON *.* TO `myuser`@`%` IDENTIFIED BY PASSWORD '*1C89832CCEEEC59E3D41A652E0DC01680F6D20CD'
+GRANT SELECT ON `mysql`.`user` TO `myuser`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser`@`%`
+Grants for myuser1@%
+GRANT USAGE ON *.* TO `myuser1`@`%` IDENTIFIED BY PASSWORD '*91F3EE74586051165E602C7D21080DE4A18977AF'
+GRANT SELECT ON `mysql`.`user` TO `myuser1`@`%`
+GRANT EXECUTE ON PROCEDURE `sys`.`table_exists` TO `myuser1`@`%`
+GRANT EXECUTE ON FUNCTION `sys`.`quote_identifier` TO `myuser1`@`%`
+
+#####################################################################
+# mtr regression test on 11.8.10 build
+#####################################################################
+main.mysql_upgrade_sys_routine_grants    [ pass ]    691
+Completed: All 1 tests were successful.
